@@ -1,0 +1,136 @@
+name: Android Release
+
+# Builds a debug APK always. If signing secrets are present, also builds a
+# signed release APK + Play Store AAB, publishes a GitHub Release, and uploads
+# the AAB to the Play Console track you choose.
+#
+# Secrets (repo → Settings → Secrets and variables → Actions):
+#   WEB_APP_URL                 Live Dately URL loaded inside the Android WebView
+#   ANDROID_KEYSTORE_BASE64     Base64 of your upload keystore (.jks / .keystore)
+#   ANDROID_KEYSTORE_PASSWORD
+#   ANDROID_KEY_ALIAS
+#   ANDROID_KEY_PASSWORD
+#   PLAY_SERVICE_ACCOUNT_JSON   Google Play Android Developer service-account JSON
+#
+# Trigger: push a tag like v1.0.0, or run this workflow from the Actions tab.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      track:
+        description: Play Store track
+        type: choice
+        options: [internal, alpha, beta, production]
+        default: internal
+      skip_play:
+        description: Skip Play Store upload
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      WEB_APP_URL: ${{ secrets.WEB_APP_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install JS deps
+        run: npm ci
+
+      - name: Install Capacitor
+        run: npm install --no-save @capacitor/core @capacitor/cli @capacitor/android @capacitor/splash-screen @capacitor/status-bar
+
+      - name: Write Capacitor config
+        run: node scripts/prepare-android.mjs
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Stamp version
+        run: node scripts/prepare-android.mjs
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dately-debug
+          path: android/app/build/outputs/apk/debug/*.apk
+
+      - name: Decode upload keystore
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > /tmp/dately-upload.jks
+
+      - name: Build signed release APK + AAB
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease bundleRelease --no-daemon \
+            -Pandroid.injected.signing.store.file=/tmp/dately-upload.jks \
+            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD"
+
+      - name: Collect release artifacts
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        run: |
+          mkdir -p dist-android
+          cp android/app/build/outputs/apk/debug/*.apk dist-android/Dately-debug.apk
+          cp android/app/build/outputs/apk/release/*.apk dist-android/Dately-release.apk
+          cp android/app/build/outputs/bundle/release/*.aab dist-android/Dately-release.aab
+
+      - name: Collect debug-only artifacts
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 == '' }}
+        run: |
+          mkdir -p dist-android
+          cp android/app/build/outputs/apk/debug/*.apk dist-android/Dately-debug.apk
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('nightly-{0}', github.run_number) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Nightly {0}', github.run_number) }}
+          generate_release_notes: true
+          prerelease: ${{ github.ref_type != 'tag' }}
+          files: dist-android/*
+
+      - name: Upload AAB to Play Store
+        if: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' && secrets.ANDROID_KEYSTORE_BASE64 != '' && (github.event_name != 'workflow_dispatch' || inputs.skip_play == false) }}
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: app.dately
+          releaseFiles: dist-android/Dately-release.aab
+          track: ${{ github.event_name == 'workflow_dispatch' && inputs.track || 'internal' }}
+          status: draft
