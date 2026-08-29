@@ -38,6 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       WEB_APP_URL: ${{ secrets.WEB_APP_URL }}
+      PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
     steps:
       - uses: actions/checkout@v4
 
@@ -82,14 +83,19 @@ jobs:
           path: android/app/build/outputs/apk/debug/*.apk
 
       - name: Decode upload keystore
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        id: signing
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > /tmp/dately-upload.jks
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > /tmp/dately-upload.jks
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build signed release APK + AAB
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        if: steps.signing.outputs.present == 'true'
         working-directory: android
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -102,19 +108,17 @@ jobs:
             -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
             -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD"
 
-      - name: Collect release artifacts
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+      - name: Collect artifacts
         run: |
           mkdir -p dist-android
           cp android/app/build/outputs/apk/debug/*.apk dist-android/Dately-debug.apk
-          cp android/app/build/outputs/apk/release/*.apk dist-android/Dately-release.apk
-          cp android/app/build/outputs/bundle/release/*.aab dist-android/Dately-release.aab
-
-      - name: Collect debug-only artifacts
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 == '' }}
-        run: |
-          mkdir -p dist-android
-          cp android/app/build/outputs/apk/debug/*.apk dist-android/Dately-debug.apk
+          if [ -d android/app/build/outputs/apk/release ]; then
+            cp android/app/build/outputs/apk/release/*.apk dist-android/Dately-release.apk || true
+          fi
+          if [ -d android/app/build/outputs/bundle/release ]; then
+            cp android/app/build/outputs/bundle/release/*.aab dist-android/Dately-release.aab || true
+          fi
+          ls -la dist-android
 
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
@@ -126,7 +130,7 @@ jobs:
           files: dist-android/*
 
       - name: Upload AAB to Play Store
-        if: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' && secrets.ANDROID_KEYSTORE_BASE64 != '' && (github.event_name != 'workflow_dispatch' || inputs.skip_play == false) }}
+        if: steps.signing.outputs.present == 'true' && env.PLAY_SERVICE_ACCOUNT_JSON != '' && github.event.inputs.skip_play != 'true'
         uses: r0adkll/upload-google-play@v1
         with:
           serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
